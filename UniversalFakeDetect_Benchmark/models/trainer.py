@@ -4,7 +4,7 @@ import torch.nn as nn
 from .base_model import BaseModel, init_weights
 import sys
 from models import get_model
-from transformers import get_cosine_schedule_with_warmup # 建议引入 transformers 的 scheduler，如果没有安装可以换成 torch 原生的
+from transformers import get_cosine_schedule_with_warmup
 
 class Trainer(BaseModel):
     def name(self):
@@ -16,8 +16,7 @@ class Trainer(BaseModel):
         self.model = get_model(opt.arch, opt)
         self.lr = opt.lr
         
-        # [修改 1] EBM_Head 初始化逻辑优化
-        # 遍历 fc 模块下的所有子模块，如果是 Linear 则初始化
+        # EBM_Head 初始化
         if hasattr(self.model, 'fc'):
             for m in self.model.fc.modules():
                 if isinstance(m, torch.nn.Linear):
@@ -25,15 +24,13 @@ class Trainer(BaseModel):
                     if m.bias is not None:
                         torch.nn.init.constant_(m.bias.data, 0.0)
 
-        # [修改 2] 参数冻结逻辑适配 Dual-EBM
+        # 参数冻结逻辑
         if opt.fix_backbone:
             params = []
             for name, p in self.model.named_parameters():
-                # 只要参数名包含 'fc.' (比如 fc.energy_real.0.weight)，就认为是分类头，需要训练
                 if 'fc.' in name: 
                     params.append(p) 
                     p.requires_grad = True
-                # SVD 残差参数也需要训练 (如果有)
                 elif any(x in name for x in ['S_residual', 'U_residual', 'V_residual']):
                     params.append(p)
                     p.requires_grad = True
@@ -44,65 +41,84 @@ class Trainer(BaseModel):
             print("Your backbone is not fixed. Training all parameters.")
             params = self.model.parameters()
 
-        # 优化器设置
+        # 优化器
         if opt.optim == 'adam':
-            # 这里的 beta2 设为 0.999 是标准的，DeepfakeBench 里可能用了 AdamW
             self.optimizer = torch.optim.AdamW(params, lr=opt.lr, betas=(opt.beta1, 0.999), weight_decay=opt.weight_decay)
         elif opt.optim == 'sgd':
             self.optimizer = torch.optim.SGD(params, lr=opt.lr, momentum=0.9, weight_decay=opt.weight_decay)
         else:
             raise ValueError("optim should be [adam, sgd]")
 
-        # [修改 3] Loss 函数：使用 CrossEntropy
-        # 因为 Dual-EBM 输出的是 [-E_real, -E_fake]，这正好对应 Logits
-        # CrossEntropy 会自动做 Softmax，符合 P(y) = exp(-E_y) / Z 的能量分布公式
+        # 【核心修改】损失函数升级
+        # 1. CE Loss 用于基础分类
         self.loss_fn = nn.CrossEntropyLoss()
+        # 2. Margin Loss 用于强化 EBM 边界 (可选，如果你想追求极致)
+        self.margin = 0.5 
+        self.lambda_ebm = 0.5 
 
         self.model.to(opt.gpu_ids[0])
         
-        # [新增] Warmup Scheduler
-        # 如果 opt 中定义了 warmup_steps，则初始化调度器
+        # Warmup Scheduler
         self.scheduler = None
         if hasattr(opt, 'warmup_steps') and opt.warmup_steps > 0:
             print(f">>> Using Cosine Scheduler with {opt.warmup_steps} warmup steps.")
-            # 这里的 num_training_steps 需要估算，或者在 train.py 里传入
-            # 这里简单给一个较大的值，或者只用 constant warmup
             try:
-                # 尝试计算总步数：epoch * iter_per_epoch
-                # 由于 Trainer 不知道 data_loader 长度，这里我们用一个比较通用的策略
-                # 或者只在 step 阶段手动实现简单的 warmup
                 self.scheduler = get_cosine_schedule_with_warmup(
-                    self.optimizer, num_warmup_steps=opt.warmup_steps, num_training_steps=opt.niter * 1000 # 估算值，或者由外部调用
+                    self.optimizer, num_warmup_steps=opt.warmup_steps, num_training_steps=opt.niter * 1000 
                 )
             except:
-                pass # 如果没装 transformers 库，就忽略
+                pass 
 
     def set_input(self, input):
         self.input = input[0].to(self.device)
-        self.label = input[1].to(self.device).long() # Label 必须是 long 类型
+        self.label = input[1].to(self.device).long() 
 
     def forward(self):
-        # [修改 4] 移除 view(-1).unsqueeze(1)
-        # Dual-EBM 输出 shape 为 [Batch, 2]，直接保留即可
+        # Dual-EBM 输出 shape 为 [Batch, 2] -> [-E_real, -E_fake]
         self.output = self.model(self.input)
-        # 确保 output 是 [B, 2]
         if self.output.dim() == 1:
-             # 万一只有一个输出，兼容处理
              pass 
 
     def get_loss(self):
-        return self.loss_fn(self.output, self.label)
+        # --- 纯正 Dual-Head EBM 优化策略 ---
+        # self.output = [-E_real, -E_fake] (即 Logits)
+        
+        # 1. 基础 CrossEntropy (保证收敛)
+        ce_loss = self.loss_fn(self.output, self.label)
+        
+        # 2. EBM Margin Loss (增强泛化)
+        # 逻辑：
+        # 对于真图 (Label=0): 我们希望 -E_real >> -E_fake (即 E_real << E_fake)
+        # 对于假图 (Label=1): 我们希望 -E_fake >> -E_real (即 E_fake << E_real)
+        
+        logits_real = self.output[:, 0]
+        logits_fake = self.output[:, 1]
+        
+        # diff = Logit_Real - Logit_Fake
+        # 如果是真图，diff 应该很大；假图，diff 应该很小(负数)
+        diff = logits_real - logits_fake
+        
+        # 只有当能量差距不够大时才产生 Loss
+        is_real = (self.label == 0)
+        is_fake = (self.label == 1)
+        
+        # Hinge Loss:
+        # Real: max(0, 0.5 - (L_real - L_fake)) -> 强迫 L_real 比 L_fake 大 0.5
+        loss_real = torch.clamp(self.margin - diff[is_real], min=0).mean()
+        
+        # Fake: max(0, 0.5 + (L_real - L_fake)) -> 强迫 L_fake 比 L_real 大 0.5
+        loss_fake = torch.clamp(self.margin + diff[is_fake], min=0).mean()
+        
+        ebm_loss = loss_real + loss_fake
+        
+        # 组合 Loss
+        return ce_loss + self.lambda_ebm * ebm_loss
 
     def optimize_parameters(self):
         self.forward()
-        
-        # 计算 Loss
-        self.loss = self.loss_fn(self.output, self.label)
-
+        self.loss = self.get_loss() # 使用新的 Loss 计算逻辑
         self.optimizer.zero_grad()
         self.loss.backward()
         self.optimizer.step()
-        
-        # 更新 Scheduler
         if self.scheduler:
             self.scheduler.step()
