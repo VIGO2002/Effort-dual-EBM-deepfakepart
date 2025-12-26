@@ -73,7 +73,7 @@ class DualEnergyHead(nn.Module):
         # 限制噪声范围在 [0.001, 0.1] 之间，防止训练初期噪声过大导致崩塌
         if training:
             # 原代码: max=0.1
-            # 建议修改: max=0.05 (在 forward 函数里)
+            # 修改: max=0.05
             std = torch.clamp(self.noise_std, min=0.001, max=0.05)
             noise = torch.randn_like(h) * std
             h_noisy = h + noise
@@ -148,7 +148,7 @@ class EffortDetector(nn.Module):
         self.backbone = self.build_backbone(config)
 
         # 1. 【修改】从 config 读取 noise_std，如果 YAML 没写，默认用 0.01
-        # 这就和你 YAML 里的 "noise_std: 0.02" 对应上了
+        # 和 YAML 里的 "noise_std: 0.02" 对应上
         initial_noise = config.get('noise_std', 0.01)
 
         # 2. 【修改】把这个参数传给 DualEnergyHead
@@ -280,7 +280,7 @@ class EffortDetector(nn.Module):
 
     def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
         label = data_dict['label']
-        # 修改点：直接使用 logits (Tensor)，不要用 prob，也不要转 numpy
+        # 修改点：直接使用 logits (Tensor)
         # calculate_metrics_for_train 内部需要 Tensor 来做 torch.max 和 .size(1) 操作
         logits = pred_dict['logits']
         
