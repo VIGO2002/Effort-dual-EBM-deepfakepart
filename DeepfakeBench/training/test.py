@@ -64,7 +64,7 @@ def prepare_testing_data(config):
         config = config.copy()  # create a copy of config to avoid altering the original one
         config['test_dataset'] = test_name  # specify the current test dataset
         
-        # 1. 使用原本正确的类名 (DeepfakeAbstractBaseDataset)
+        # 1. 使用原本的类名 (DeepfakeAbstractBaseDataset)
         test_set = DeepfakeAbstractBaseDataset(
                 config=config,
                 mode='test',
