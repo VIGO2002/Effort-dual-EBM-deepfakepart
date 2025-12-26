@@ -237,9 +237,9 @@ label_dict:
 
   label_dict:
   # ... 原有的内容 ...
-  WDF_Fake: 1  # 这是原来的，可以留着
-  WDF_Real: 0  # 这是原来的，可以留着
+  WDF_Fake: 1  
+  WDF_Real: 0  
   
-  # 【必须添加这两行】适配脚本生成的 JSON
+  # 适配脚本生成的 JSON
   "0": 0
   "1": 1
